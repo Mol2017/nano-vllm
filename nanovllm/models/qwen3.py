@@ -23,7 +23,6 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -56,7 +55,6 @@ class Qwen3Attention(nn.Module):
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -70,19 +68,31 @@ class Qwen3Attention(nn.Module):
 
     def forward(
         self,
+        # [n_tokens]
         positions: torch.Tensor,
+        # [n_tokens, hidden_dim]
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # [n_tokens, qkv_hidden_dim]
         qkv = self.qkv_proj(hidden_states)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # [n_tokens, n_heads, head_dim]
         q = q.view(-1, self.num_heads, self.head_dim)
+        # [n_tokens, n_kv_heads, head_dim]
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # [n_tokens, n_heads, head_dim], [n_tokens, n_kv_heads, head_dim]
         q, k = self.rotary_emb(positions, q, k)
+        
+        # prefill: [n_tokens, n_heads, head_dim] 
+        # decode: [n_tokens, 1, n_heads, head_dim]
         o = self.attn(q, k, v)
+
+        # [n_tokens, hidden_dim] 
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -132,7 +142,6 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -144,16 +153,24 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward(
         self,
+        # [n_tokens]
         positions: torch.Tensor,
+        # [n_tokens, hidden_dim]
         hidden_states: torch.Tensor,
+        # [n_tokens, hidden_dim]
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
+            # [n_tokens, hidden_dim], [n_tokens, hidden_dim]
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
+            # [n_tokens, hidden_dim], [n_tokens, hidden_dim]
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # [n_tokens, hidden_dim]
         hidden_states = self.self_attn(positions, hidden_states)
+        # [n_tokens, hidden_dim], [n_tokens, hidden_dim]
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # [n_tokens, hidden_dim]
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -171,13 +188,20 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
+        # [n_tokens, hidden_dim]
         input_ids: torch.Tensor,
+        # [n_tokens]
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        # [n_tokens, hidden_dim]
         hidden_states = self.embed_tokens(input_ids)
+        
         residual = None
         for layer in self.layers:
+            # [n_tokens, hidden_dim], [n_tokens, hidden_dim]
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+        # [n_tokens, hidden_dim]
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -206,10 +230,31 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Compute hidden states from input token ids and positions.
+        
+        Args:
+            input_ids: [n_tokens, hidden_dim]
+            positions: [n_tokens]
+                
+        Returns:
+            hidden_states: [n_tokens, hidden_dim]
+        """
+        # [n_tokens, hidden_dim]
         return self.model(input_ids, positions)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Compute logits from hidden states.
+
+        Args:
+            hidden_states: [n_tokens, hidden_dim]
+        
+        Returns:
+            logits: [n_tokens, vocab_size]
+        """
+        # [n_tokens, vocab_size]
         return self.lm_head(hidden_states)

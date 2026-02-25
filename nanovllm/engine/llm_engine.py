@@ -18,6 +18,8 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        
+        # tensor parallelism on multiple processes
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -27,9 +29,15 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
+        
+        # main process
         self.model_runner = ModelRunner(config, 0, self.events)
+
+        # load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+
+        # scheduler
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
@@ -40,14 +48,22 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        # 1. Tokenize the prompt.
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+
+        # 2. Create a Sequence and add it to the scheduler.
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
     def step(self):
+        # 1. Get tasks from the scheduler.
         seqs, is_prefill = self.scheduler.schedule()
+
+        # 2. Run the model to get the next token ids.
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        # 3. Postprocess the results and update the scheduler.
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)

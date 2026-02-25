@@ -23,21 +23,30 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # Initialize GPU-to-GPU communication
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        # Load model & sampler
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
+        
+        # Allocate KV cache
         self.allocate_kv_cache()
+
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # Set up shared memory for inter-process communication
+        # - The main process writes method calls and arguments to shared memory.
+        # - The other processes read and execute them.
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -67,18 +76,25 @@ class ModelRunner:
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
+        # 1. Wait for the main process to write a method call and arguments to shared memory.
         self.event.wait()
+
+        # 2. Read the method name and arguments from shared memory.
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        
         self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        # 1. Write the method name and arguments to shared memory.
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
+
+        # 2. Notify the other processes to read and execute.
         for event in self.event:
             event.set()
 
@@ -106,9 +122,12 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+
+        # Allocate a contiguous KV cache
+        # [2 (k, v), n_layers, n_blocks, block_size, n_heads, head_dim]
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -144,6 +163,7 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
+            # Map token positions to KV cache slots.
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -206,10 +226,22 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 1. Prepare model inputs from sequences.
+        # [n_seqs*seq_len], [n_seqs*seq_len]
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+
+        # 2. Set up sampling termperatures.
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        # 3. Run the model to get the next token ids.
+        # [n_seqs, vocab_size]
         logits = self.run_model(input_ids, positions, is_prefill)
+
+        # 4. Sample the next token ids from the logits.
+        # [n_seqs]
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+        # 5. Reset context.
         reset_context()
         return token_ids
 

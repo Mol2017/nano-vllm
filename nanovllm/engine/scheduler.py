@@ -31,7 +31,7 @@ class Scheduler:
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq) # allocate blocks for the sequence.
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
@@ -51,7 +51,7 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq) # allocate a new block if needed.
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
